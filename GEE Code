@@ -1,0 +1,221 @@
+//Center the map to the region of interest using the region shapefile
+Map.centerObject(geometry,9)
+Map.setOptions('satellite')
+
+
+//     a function to mask clouds
+
+function maskClouds(image) {
+  
+  // Bits 3 and 5 are cloud shadow and cloud, respectively.
+    var cloudShadowBitMask = ee.Number(2).pow(3).int();
+    var cloudsBitMask = ee.Number(2).pow(5).int();  
+    
+    // Get the QA_PIXEL band.
+    var qa = image.select('QA_PIXEL');
+    
+     // Both flags should be set to zero, indicating clear conditions.
+    var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0).and(qa.bitwiseAnd(cloudsBitMask).eq(0)); 
+  
+  // Return the masked image, scaled to [0, 1].
+  return image.updateMask(mask).divide(10000).copyProperties(image, ["system:time_start"]);
+}
+
+//2.2) Adding Spectral Indices
+///////////////////////////////
+
+// This function maps spectral indices for Mangrove Mapping using Landsat 8 Imagery
+var addIndicesL8 = function(img) {
+  // NDVI
+  var ndvi = img.normalizedDifference(['SR_B5','SR_B4']).rename('NDVI');
+  // NDMI (Normalized Difference Mangrove Index - Shi et al 2016 - New spectral metrics for mangrove forest identification)
+  var ndmi = img.normalizedDifference(['SR_B7','SR_B3']).rename('NDMI');
+  // MNDWI (Modified Normalized Difference Water Index - Hanqiu Xu, 2006)
+  var mndwi = img.normalizedDifference(['SR_B3','SR_B6']).rename('MNDWI');
+  // SR (Simple Ratio)
+  var sr = img.select('SR_B5').divide(img.select('SR_B4')).rename('SR');
+  // MVI
+  var mvi = img.select('SR_B5').subtract(img.select('SR_B3')).divide(img.select('SR_B6').subtract(img.select('SR_B3'))).rename('MVI');
+  // Band Ratio 54
+  var ratio54 = img.select('SR_B6').divide(img.select('SR_B5')).rename('R54');
+  // Band Ratio 35
+  var ratio35 = img.select('SR_B4').divide(img.select('SR_B6')).rename('R35');
+  // GCVI
+  var gcvi = img.expression('(NIR/GREEN)-1',{
+    'NIR':img.select('SR_B5'),
+    'GREEN':img.select('SR_B3')
+  }).rename('GCVI');
+  return img
+    .addBands(ndvi)
+    .addBands(ndmi)
+    .addBands(mndwi)
+    .addBands(mvi)
+    .addBands(sr)
+    .addBands(ratio54)
+    .addBands(ratio35)
+    .addBands(gcvi);
+};
+
+//2.3) Filter Landsat data by Date and Region
+/////////////////////////////////////////////
+
+// Temporal Parameters
+
+// Select the desired central year here
+var year = 2019; 
+
+// Start date will be set one year before the central year
+var startDate = (year)+'-01-01'; 
+
+// End date will be set to one year later than the central year.
+var endDate = (year)+'-12-31'; 
+
+//2.4) Apply filters and masks to Landsat 8 imagery
+///////////////////////////////////////////////////
+
+var l8 = L8.filterDate(startDate,endDate)
+// Mask for clouds and cloud shadows
+    .map(maskClouds)
+//Add the indices
+    .map(addIndicesL8)
+    
+
+var composite = l8
+              // Uses the median reducer
+              .median() 
+              // Clips the composite to our area of interest
+              .clip(geometry); 
+print(composite);
+Map.addLayer(composite, {bands:['SR_B4', 'SR_B3', 'SR_B2'], min:0, max:0.1}, 'Landsat Image of '+(year));
+
+var classes = Mangrove.merge(NonMangrove)
+
+
+var bands = ['SR_B5','SR_B6','SR_B4','NDVI','MNDWI','SR','GCVI','MVI','NDMI']
+
+var image = composite.select(bands).clip(geometry)
+
+var samples = image.sampleRegions({
+    collection: classes, // Set of geometries selected for training
+    properties: ['landcover'], // Label from each geometry
+    scale: 30 // Make each sample the same size as Landsat pixel
+    }).randomColumn('random'); // creates a column with random numbers
+
+var split = 0.8; // Roughly 80% for training, 20% for testing.
+var training = samples.filter(ee.Filter.lt('random', split)); //Subset training data
+var testing = samples.filter(ee.Filter.gte('random', split)); //Subset testing data
+
+    print('Samples n =', samples.aggregate_count('.all'));
+    print('Training n =', training.aggregate_count('.all'));
+    print('Testing n =', testing.aggregate_count('.all'));
+
+
+    var classifier = ee.Classifier.smileRandomForest(100,5).train({ 
+    features: training.select(['SR_B5','SR_B6','SR_B4','NDVI','MNDWI','SR','GCVI','MVI','NDMI', 'landcover']), //Train using bands and landcover property
+    classProperty: 'landcover', //Pull the landcover property from classes
+    inputProperties: bands
+    });
+
+
+    var validation = testing.classify(classifier);
+    var testAccuracy = validation.errorMatrix('landcover', 'classification');
+    print('Validation error matrix RF: ', testAccuracy);
+    print('Validation overall accuracy RF: ', testAccuracy.accuracy());
+
+    var classifiedrf = image.select(bands) // select the predictors
+                      .classify(classifier); // .classify applies the Random Forest
+                      
+
+    var pixelcount = classifiedrf.connectedPixelCount(100, false); //Create an image that shows the number of pixels each pixel is connected to
+    var countmask = pixelcount.select(0).gt(25); //filter out all pixels connected to 4 or less 
+
+//Mask the results to only display mangrove extent
+    var classMask = classifiedrf.select('classification').gt(0)
+    var classed= classifiedrf.updateMask(countmask).updateMask(classMask)
+
+
+//Add classification to map
+Map.addLayer (classed, {min: 1, max: 1, palette:'blue'}, 'Mangrove Extent' +(year));
+
+
+// Export an ee.FeatureCollection as an Earth Engine asset.
+// Export.table.toAsset({
+//   collection: Mangrove,
+//   description:'MangroveSample',
+//   assetId: 'Mangrove',
+// });
+      
+// Export.table.toAsset({
+//   collection: NonMangrove,
+//   description:'NonMangroveSample',
+//   assetId: 'NonMangrove',
+// });
+
+
+var get2019 = classed.multiply(ee.Image.pixelArea()).divide(10000).reduceRegion({
+      reducer:ee.Reducer.sum(),
+      geometry:geometry,
+      scale: 100,
+      maxPixels:1e13,
+      tileScale: 16
+      }).get('classification');
+      
+print(get2019, 'Mangrove Extent' +(year)+' in ha')
+
+
+
+//exporter
+
+//convert to vector
+// print(classed.bandNames());
+
+// var M19 = classed.reduceToVectors({
+//   geometry: geometry,
+//   scale: 30,
+//   labelProperty: 'Mangrove',
+//   tileScale: 4,
+//   bestEffort: true,
+// });
+
+// Map.addLayer (M19, {palette:'red'}, 'Mangrove Extent 2019 Vector');
+var dict = classifier.explain();
+print('Explain:',dict);
+ 
+var variable_importance = ee.Feature(null, ee.Dictionary(dict).get('importance'));
+ 
+var chart =
+ui.Chart.feature.byProperty(variable_importance)
+.setChartType('ColumnChart')
+.setOptions({
+title: 'Random Forest Variable Importance',
+legend: {position: 'none'},
+hAxis: {title: 'Bands'},
+vAxis: {title: 'Importance'}
+});
+ 
+print(chart);
+//8.1) 2019 Mangrove Extent
+//------------------
+Export.image.toDrive({
+  image: classed,
+  description: (year)+'ShundarbanExtent',
+  region: geometry,
+  folder: 'GEE',
+  scale: 30,
+  maxPixels: 1e13,
+  skipEmptyTiles: true,
+  });
+
+// 8.3) Shapefile export
+// -------------------------
+// Export.table.toDrive({
+//   collection: M19,
+//   description:'MangroveShapefile2',
+//   folder: 'GEE',
+//   fileFormat: 'SHP',
+// });
+
+//   description:'Mangrove',
+//   fileFormat: 'SHP',
+// });
+
